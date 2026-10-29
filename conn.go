@@ -119,6 +119,10 @@ type Conn struct {
 	// handshake, nor deliver application data. Protected by in.Mutex.
 	retryCount int
 
+	// realityMaxUselessRecords, when positive, overrides maxUselessRecords so a
+	// REALITY server tolerates the same number of non-advancing records as its target.
+	realityMaxUselessRecords int
+
 	// activeCall indicates whether Close has been call in the low bit.
 	// the rest of the bits are the number of goroutines in Conn.Write.
 	activeCall atomic.Int32
@@ -822,11 +826,18 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 	return nil
 }
 
+func (c *Conn) maxUselessRecords() int {
+	if c.realityMaxUselessRecords > 0 {
+		return c.realityMaxUselessRecords
+	}
+	return maxUselessRecords
+}
+
 // retryReadRecord recurs into readRecordOrCCS to drop a non-advancing record, like
 // a warning alert, empty application_data, or a change_cipher_spec in TLS 1.3.
 func (c *Conn) retryReadRecord(expectChangeCipherSpec bool) error {
 	c.retryCount++
-	if c.retryCount > maxUselessRecords {
+	if c.retryCount > c.maxUselessRecords() {
 		c.sendAlert(alertUnexpectedMessage)
 		return c.in.setErrorLocked(errors.New("tls: too many ignored records"))
 	}
@@ -1365,7 +1376,7 @@ func (c *Conn) handlePostHandshakeMessage() error {
 		return err
 	}
 	c.retryCount++
-	if c.retryCount > maxUselessRecords {
+	if c.retryCount > c.maxUselessRecords() {
 		c.sendAlert(alertUnexpectedMessage)
 		return c.in.setErrorLocked(errors.New("tls: too many non-advancing records"))
 	}

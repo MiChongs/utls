@@ -3,6 +3,7 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -12,6 +13,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"github.com/metacubex/utls/internal/mlkem"
 	"github.com/metacubex/utls/internal/ratelimit"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
@@ -112,6 +115,15 @@ type RealityConfig struct {
 	LimitFallbackUpload   RealityLimitFallback
 	LimitFallbackDownload RealityLimitFallback
 
+	// Mldsa65Key, when set, adds an ML-DSA-65 signature over the handshake to the
+	// certificate, in the same format as Xray's REALITY (mldsa65Seed / mldsa65Verify).
+	Mldsa65Key *mldsa65.PrivateKey
+
+	// ClassicalKeyShare makes the server complete the TLS key exchange with plain
+	// X25519 whenever the client offered an X25519 key share, even if the target
+	// selected X25519MLKEM768. By default the target's choice is mirrored.
+	ClassicalKeyShare bool
+
 	Config
 }
 
@@ -130,6 +142,8 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		ShortIds:              a.ShortIds,
 		LimitFallbackUpload:   a.LimitFallbackUpload,
 		LimitFallbackDownload: a.LimitFallbackDownload,
+		Mldsa65Key:            a.Mldsa65Key,
+		ClassicalKeyShare:     a.ClassicalKeyShare,
 		Config:                *a.Config.Clone(),
 	}
 }
@@ -197,10 +211,21 @@ func onceValues[T1, T2 any](f func() (T1, T2)) func() (T1, T2) {
 	}
 }
 
-var realityServerCert = onceValues(func() (ed25519Priv ed25519.PrivateKey, signedCert []byte) {
+type realityServerCertificates struct {
+	signedCert        []byte
+	signedCertMldsa65 []byte
+	// mldsa65Offset is where the ML-DSA-65 signature lives in signedCertMldsa65,
+	// i.e. the value of its first extension.
+	mldsa65Offset int
+}
+
+var realityServerCert = onceValues(func() (ed25519Priv ed25519.PrivateKey, certificates realityServerCertificates) {
 	certificate := x509.Certificate{SerialNumber: &big.Int{}}
+	certificateMldsa65 := x509.Certificate{SerialNumber: &big.Int{}, ExtraExtensions: []pkix.Extension{{Id: []int{0, 0}, Value: make([]byte, mldsa65.SignatureSize)}}}
 	_, ed25519Priv, _ = ed25519.GenerateKey(rand.Reader)
-	signedCert, _ = x509.CreateCertificate(rand.Reader, &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+	certificates.signedCert, _ = x509.CreateCertificate(rand.Reader, &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+	certificates.signedCertMldsa65, _ = x509.CreateCertificate(rand.Reader, &certificateMldsa65, &certificateMldsa65, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+	certificates.mldsa65Offset = bytes.Index(certificates.signedCertMldsa65, make([]byte, mldsa65.SignatureSize))
 	return
 })
 
@@ -225,6 +250,16 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 		}
 	*/
 	{
+		if config.ClassicalKeyShare && hs.hello.serverShare.group == X25519MLKEM768 {
+			for _, clientShare := range hs.clientHello.keyShares {
+				if clientShare.group == X25519 && len(clientShare.data) == 32 {
+					// The Server Hello is re-encoded below, so it no longer aliases the target's bytes.
+					hs.hello.serverShare = keyShare{group: X25519, data: make([]byte, 32)}
+					hs.hello.original = nil
+					break
+				}
+			}
+		}
 		if config.Log != nil {
 			config.Log("REALITY remoteAddr: %v using X25519MLKEM768: %v", c.RemoteAddr().String(), hs.hello.serverShare.group == X25519MLKEM768)
 		}
@@ -258,6 +293,14 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 			copy(hs.hello.serverShare.data, append(ciphertext, hs.hello.serverShare.data[:32]...))
 		}
 
+		if hs.hello.original == nil {
+			original, err := hs.hello.marshal()
+			if err != nil {
+				return err
+			}
+			hs.hello.original = original
+		}
+
 		c.serverName = hs.clientHello.serverName
 	}
 	/*
@@ -269,12 +312,29 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 		}
 	*/
 	{
-		ed25519Priv, signedCert := realityServerCert()
-		signedCert = append([]byte{}, signedCert...)
+		ed25519Priv, certificates := realityServerCert()
+		var signedCert []byte
+		if config.Mldsa65Key != nil {
+			signedCert = append([]byte{}, certificates.signedCertMldsa65...)
+		} else {
+			signedCert = append([]byte{}, certificates.signedCert...)
+		}
 
 		h := hmac.New(sha512.New, hs.AuthKey)
 		h.Write(ed25519Priv[32:])
 		h.Sum(signedCert[:len(signedCert)-64])
+
+		if config.Mldsa65Key != nil {
+			if certificates.mldsa65Offset < 0 {
+				return errors.New("REALITY: invalid ML-DSA-65 certificate template")
+			}
+			h.Write(hs.clientHello.original)
+			h.Write(hs.hello.original)
+			signature := signedCert[certificates.mldsa65Offset : certificates.mldsa65Offset+mldsa65.SignatureSize]
+			if err := mldsa65.SignTo(config.Mldsa65Key, h.Sum(nil), nil, false, signature); err != nil {
+				return errors.New("REALITY: failed to sign with ML-DSA-65 key: " + err.Error())
+			}
+		}
 
 		hs.cert = &Certificate{
 			Certificate: [][]byte{signedCert},
@@ -347,6 +407,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	if config.Log != nil {
 		config.Log("REALITY remoteAddr: %v", remoteAddr)
 	}
+	DetectPostHandshakeRecordsLens(config)
 
 	target, err := config.DialContext(ctx, config.Type, config.Dest)
 	if err != nil {
@@ -552,6 +613,13 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			err = hs.readClientFinished()
 			if config.Log != nil {
 				config.Log("REALITY remoteAddr: %v hs.readClientFinished() err: %v", remoteAddr, err)
+			}
+			if err != nil {
+				break
+			}
+			err = hs.c.realityWritePostHandshakeRecords(realityDetectKey(config.Dest, hs.clientHello.serverName, hs.clientHello.alpnProtocols))
+			if config.Log != nil {
+				config.Log("REALITY remoteAddr: %v hs.c.realityWritePostHandshakeRecords() err: %v", remoteAddr, err)
 			}
 			if err != nil {
 				break

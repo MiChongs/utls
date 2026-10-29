@@ -1,6 +1,6 @@
 module github.com/metacubex/utls
 
-go 1.20
+go 1.22.0
 
 retract (
 	v1.4.1 // #218
@@ -12,5 +12,9 @@ require (
 	github.com/klauspost/compress v1.17.9 // lastest version compatible with golang1.20
 	golang.org/x/crypto v0.33.0 // lastest version compatible with golang1.20
 	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e // lastest version compatible with golang1.20
+)
+
+require (
+	github.com/cloudflare/circl v1.6.1 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 )
