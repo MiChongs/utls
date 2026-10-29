@@ -124,6 +124,10 @@ type RealityConfig struct {
 	// selected X25519MLKEM768. By default the target's choice is mirrored.
 	ClassicalKeyShare bool
 
+	// Fallback, when set, authenticates the Client Hello before mirroring and
+	// relays failed connections to the fallback target, see RealityFallbackOptions.
+	Fallback *RealityFallbackOptions
+
 	Config
 }
 
@@ -144,6 +148,7 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		LimitFallbackDownload: a.LimitFallbackDownload,
 		Mldsa65Key:            a.Mldsa65Key,
 		ClassicalKeyShare:     a.ClassicalKeyShare,
+		Fallback:              a.Fallback,
 		Config:                *a.Config.Clone(),
 	}
 }
@@ -408,6 +413,14 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 		config.Log("REALITY remoteAddr: %v", remoteAddr)
 	}
 	DetectPostHandshakeRecordsLens(config)
+
+	if config.Fallback != nil {
+		var err error
+		conn, err = realityFallbackPrecheck(ctx, conn, config)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	target, err := config.DialContext(ctx, config.Type, config.Dest)
 	if err != nil {
