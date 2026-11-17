@@ -14,6 +14,7 @@ import (
 	"math"
 	"math/big"
 	"math/rand"
+	"slices"
 	"sort"
 	"strconv"
 
@@ -3108,15 +3109,24 @@ func generateRandomizedSpec(
 		ks := KeyShareExtension{[]KeyShare{
 			{Group: X25519}, // the key for the group will be generated later
 		}}
+		// A hello advertising X25519MLKEM768 must also carry its key share, as
+		// real clients do: servers prefer the hybrid group, and a
+		// HelloRetryRequest selecting it cannot be answered. Conversely a key
+		// share must not be sent for a group that is not advertised (RFC 8446
+		// Section 4.2.8).
+		advertisesMLKEM := slices.Contains(curveIDs, X25519MLKEM768)
 		if r.FlipWeightedCoin(id.Weights.FirstKeyShare_Set_CurveP256) { // legacy setting, not used by default
 			ks.KeyShares[0].Group = CurveP256
 		} else {
 			if r.FlipWeightedCoin(id.Weights.KeyShare_Append_RandomGroups) {
 				ks.KeyShares = append(ks.KeyShares, KeyShare{Group: CurveP256})
 			}
-			if r.FlipWeightedCoin(id.Weights.KeyShare_Append_RandomGroups) {
-				ks.KeyShares = append([]KeyShare{{Group: X25519MLKEM768}}, ks.KeyShares...)
-			}
+			// formerly decided the hybrid key share; still flipped so a seed
+			// derives the same remaining extensions
+			r.FlipWeightedCoin(id.Weights.KeyShare_Append_RandomGroups)
+		}
+		if advertisesMLKEM {
+			ks.KeyShares = append([]KeyShare{{Group: X25519MLKEM768}}, ks.KeyShares...)
 		}
 		pskExchangeModes := PSKKeyExchangeModesExtension{[]uint8{pskModeDHE}}
 		supportedVersionsExt := SupportedVersionsExtension{
